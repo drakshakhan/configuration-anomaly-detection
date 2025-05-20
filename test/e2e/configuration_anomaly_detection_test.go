@@ -15,12 +15,19 @@ import (
 	"github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	machinev1beta1 "github.com/openshift/api/machine/v1beta1"
 	awsinternal "github.com/openshift/configuration-anomaly-detection/pkg/aws"
+	machineutil "github.com/openshift/configuration-anomaly-detection/pkg/investigations/utils/machine"
+	k8sclient "github.com/openshift/configuration-anomaly-detection/pkg/k8s"
 	"github.com/openshift/configuration-anomaly-detection/pkg/ocm"
 	ocme2e "github.com/openshift/osde2e-common/pkg/clients/ocm"
 	"github.com/openshift/osde2e-common/pkg/clients/openshift"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logger "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -32,6 +39,7 @@ var _ = Describe("Configuration Anomaly Detection", Ordered, func() {
 		region    string
 		provider  string
 		clusterID string
+		k8sClient k8sclient.Client
 	)
 
 	BeforeAll(func(ctx context.Context) {
@@ -56,6 +64,9 @@ var _ = Describe("Configuration Anomaly Detection", Ordered, func() {
 
 		k8s, err = openshift.New(ginkgo.GinkgoLogr)
 		Expect(err).ShouldNot(HaveOccurred(), "Unable to setup k8s client")
+
+		k8sClient, err = k8sclient.New(clusterID, ocmCli, "MachineHealthCheckE2E")
+		Expect(err).ShouldNot(HaveOccurred(), "Unable to initialize raw k8sClient")
 
 		region, err = k8s.GetRegion(ctx)
 		Expect(err).NotTo(HaveOccurred(), "Could not determine region")
@@ -115,7 +126,7 @@ var _ = Describe("Configuration Anomaly Detection", Ordered, func() {
 			Expect(BlockEgress(ctx, ec2Wrapper, sgID)).To(Succeed(), "Failed to block egress")
 			ginkgo.GinkgoWriter.Printf("Egress blocked\n")
 
-			time.Sleep(20 * time.Minute)
+			time.Sleep(1 * time.Minute)
 
 			lsResponseAfter, err := GetLimitedSupportReasons(ocme2eCli, clusterID)
 			Expect(err).NotTo(HaveOccurred(), "Failed to get limited support reasons")
@@ -205,7 +216,7 @@ var _ = Describe("Configuration Anomaly Detection", Ordered, func() {
 			Expect(err).ToNot(HaveOccurred(), "failed to scale down alertmanager")
 			fmt.Printf("Alertmanager scaled down from %d to 0 replicas. Waiting...\n", originalAMReplicas)
 
-			time.Sleep(20 * time.Minute)
+			time.Sleep(1 * time.Minute)
 
 			logs, err = GetServiceLogs(ocmCli, cluster)
 			Expect(err).ToNot(HaveOccurred(), "Failed to get service logs")
@@ -266,4 +277,85 @@ var _ = Describe("Configuration Anomaly Detection", Ordered, func() {
 			fmt.Println("Test completed: All components restored to original replica counts.")
 		}
 	})
+
+	It("AWS CCS: MachineHealthCheckUnterminatedShortCircuitSRE - node is NotReady", func(ctx context.Context) {
+		if provider == "aws" {
+			fmt.Println("Fetching cluster nodes...")
+
+			// Getting of Machines
+			machineList := &machinev1beta1.MachineList{}
+			err := k8sClient.List(ctx, machineList, &client.ListOptions{
+				Namespace: machineutil.MachineNamespace,
+			})
+			Expect(err).NotTo(HaveOccurred(), "Failed to list machines")
+
+			fmt.Println("Priting machine list", machineList)
+
+			if len(machineList.Items) == 0 {
+				Fail("No machines found in openshift-machine-api namespace")
+			}
+
+			// Getting nodes for first machine
+			machine := &machineList.Items[0]
+			node, err := machineutil.GetNodeForMachine(ctx, k8sClient, *machine)
+			Expect(err).NotTo(HaveOccurred(), "Failed to get Node for Machine")
+			Expect(node).NotTo(BeNil(), "Node for Machine is nil")
+
+			nodeName := node.Name
+
+			// Step 3: Backup original node conditions
+			originalConditions := make([]corev1.NodeCondition, len(node.Status.Conditions))
+			copy(originalConditions, node.Status.Conditions)
+
+			// Step 4: Simulate NotReady condition on the Node
+			fmt.Println("Simulating NotReady condition on Node:", nodeName)
+			retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				key := types.NamespacedName{Name: nodeName}
+				n := &corev1.Node{}
+				if err := k8sClient.Get(ctx, key, n); err != nil {
+					return err
+				}
+
+				updated := false
+				for i, cond := range n.Status.Conditions {
+					if cond.Type == corev1.NodeReady {
+						n.Status.Conditions[i].Status = corev1.ConditionFalse
+						updated = true
+						break
+					}
+				}
+				if !updated {
+					n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
+						Type:               corev1.NodeReady,
+						Status:             corev1.ConditionFalse,
+						LastHeartbeatTime:  metav1.Now(),
+						LastTransitionTime: metav1.Now(),
+					})
+				}
+
+				return k8sClient.Status().Update(ctx, n)
+			})
+			Expect(retryErr).NotTo(HaveOccurred(), "Failed to update Node to simulate NotReady condition")
+
+			// Step 5: Wait for fallback logic to take effect
+			fmt.Println("Node set to NotReady. Waiting for 20 minutes...")
+			time.Sleep(1 * time.Minute)
+
+			// Step 6: Restore the original node conditions
+			fmt.Println("Restoring original Node conditions...")
+			restoreErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				key := types.NamespacedName{Name: nodeName}
+				n := &corev1.Node{}
+				if err := k8sClient.Get(ctx, key, n); err != nil {
+					return err
+				}
+				n.Status.Conditions = originalConditions
+				return k8sClient.Status().Update(ctx, n)
+			})
+			Expect(restoreErr).NotTo(HaveOccurred(), "Failed to restore Node conditions")
+
+			fmt.Println("Test completed: Node NotReady condition simulated and restored.")
+		}
+	})
+
 })

@@ -8,3 +8,4 @@ dist
 cad_testing
 e2e-suite.test
 payload
+/vendor

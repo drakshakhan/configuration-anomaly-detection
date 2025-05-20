@@ -79,18 +79,25 @@ func NewCfg(clusterID string, ocmClient ocm.Client, remediationName string) (cfg
 		return nil, fmt.Errorf("could not create new k8sclient: missing environment variable BACKPLANE_URL")
 	}
 
+	fmt.Println("hi1")
+
 	decoratedCfg, remediationInstanceId, err := bpremediation.CreateRemediationWithConn(
 		config.BackplaneConfiguration{URL: backplaneURL},
 		ocmClient.GetConnection(),
 		clusterID,
 		remediationName,
 	)
+
+	fmt.Println("hi2")
 	if err != nil {
+		fmt.Println("hi3")
 		if isAPIServerUnavailable(err) {
+			fmt.Println("hi4")
 			return nil, fmt.Errorf("%w: %w", ErrAPIServerUnavailable, err)
 		}
 		return nil, err
 	}
+	fmt.Println("hi5")
 
 	return &Config{*decoratedCfg, remediationCleaner{clusterID, ocmClient, remediationInstanceId}}, nil
 }
